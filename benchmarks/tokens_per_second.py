@@ -23,7 +23,7 @@ import importlib
 import inspect
 import pkgutil
 import statistics
-from time import perf_counter
+from time import perf_counter, sleep
 
 import tiktoken
 import torch
@@ -152,6 +152,12 @@ def main() -> None:
                         help="untimed warmup generations per model/device (default: 2)")
     parser.add_argument("--devices", nargs="+", choices=["cpu", "cuda", "mps"], default=None,
                         help="restrict to these devices (default: all available)")
+    parser.add_argument("--model", nargs="+", default=None,
+                        help="only benchmark models whose label contains one of these substrings "
+                             "(default: all discovered). Isolate a model in its own process to "
+                             "avoid cross-model thermal throttling.")
+    parser.add_argument("--cooldown", type=float, default=0.0,
+                        help="seconds to sleep between runs, to let the device cool (default: 0)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -166,14 +172,24 @@ def main() -> None:
     print("resolving devices:")
     devices = available_devices(args.devices)
     models = discover_models()
+    if args.model:
+        models = [(label, cls) for label, cls in models
+                  if any(pat in label for pat in args.model)]
+        if not models:
+            print(f"\nno models match {args.model}; run without --model to list them")
+            return
     print(f"\ndiscovered {len(models)} model(s): {', '.join(label for label, _ in models)}\n")
 
     header = f"{'model':<32}{'device':<8}{'tokens/sec':>18}{'new_tok':>9}"
     print(header)
     print("-" * len(header))
 
+    first = True
     for label, cls in models:
         for device in devices:
+            if args.cooldown and not first:
+                sleep(args.cooldown)
+            first = False
             try:
                 mean, std, new_tok = benchmark_model(
                     cls, config, device, prompts, args.max_new_tokens, args.warmup

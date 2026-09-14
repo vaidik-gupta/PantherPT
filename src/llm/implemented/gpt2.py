@@ -129,7 +129,21 @@ class GPT2(nn.Module):
         print("Weights loaded successfully.")
         return model
 
-    
 
+class CompiledGPT2(GPT2):
+    """GPT-2 whose forward pass is JIT-compiled with torch.compile.
 
-    
+    Identical to the eager GPT2 (same weights, state_dict and generate loop), but routes
+    the forward through a torch.compile'd graph. Compilation is lazy: it happens on the
+    first forward call, on whatever device the inputs are on.
+    """
+
+    def __init__(self, config: GPT2Config):
+        super().__init__(config)
+        # Compile the *parent* forward (not self.forward) so the compiled call does not
+        # recurse back through this override. Held as a plain attribute, so torch does
+        # not treat it as a submodule/parameter.
+        self._compiled_forward = torch.compile(GPT2.forward)
+
+    def forward(self, idx):
+        return self._compiled_forward(self, idx)
