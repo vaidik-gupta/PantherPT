@@ -128,7 +128,7 @@ class GPT2(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight   # weight tying
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx):
         B, T = idx.shape
         assert T <= self.config.n_ctx, f"sequence length {T} exceeds n_ctx {self.config.n_ctx}"
 
@@ -143,20 +143,14 @@ class GPT2(nn.Module):
 
         x = self.ln_f(x)
         logits = self.lm_head(x)   # [B, T, vocab_size]
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
-        return logits, loss
+        return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=50, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens=50, temperature=1.0, top_k=None, eos_token_id=None):
         """Simple autoregressive sampling loop (no KV-cache, for clarity)."""
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.n_ctx else idx[:, -self.config.n_ctx:]
-            logits, _ = self(idx_cond)
+            logits = self(idx_cond)
             logits = logits[:, -1, :] / temperature
 
             if top_k is not None:
@@ -166,6 +160,10 @@ class GPT2(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_id), dim=1)
+
+            # Stop early once every sequence has emitted the end-of-sequence token.
+            if eos_token_id is not None and (next_id == eos_token_id).all():
+                break
         return idx
 
     @classmethod

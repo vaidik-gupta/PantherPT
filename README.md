@@ -80,6 +80,14 @@ uv run python main.py        # environment sanity check (torch/transformers/devi
 uv run pytest                # run the test suite
 ```
 
+Benchmark generation throughput (tokens/sec) for every LLM in `implemented/` and
+`pretrained/`, across all available devices (unavailable ones are skipped):
+
+```bash
+uv run python -m benchmarks.tokens_per_second               # real gpt2 (124M)
+uv run python -m benchmarks.tokens_per_second --config tiny # fast smoke run
+```
+
 Load real GPT-2 weights into the from-scratch model and generate:
 
 ```bash
