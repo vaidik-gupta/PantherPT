@@ -1,5 +1,6 @@
 
-from src.utils.attention import AttentionConfigBase, SelfAttention
+from src.utils.attention import AttentionConfigBase, SelfAttention, SelfAttentionWithKVCache
+from src.utils.KVState import KVState
 from src.llm.config.gpt2 import GPT2Config
 import torch
 import torch.nn as nn
@@ -147,3 +148,88 @@ class CompiledGPT2(GPT2):
 
     def forward(self, idx):
         return self._compiled_forward(self, idx)
+
+
+class CachedBlock(nn.Module):
+    """Transformer block for GPT2_v2: a KV-cache-aware sibling of Block.
+
+    forward() is overloaded on kv_state:
+      - kv_state is None -> plain block, returns the hidden state (training / no cache).
+      - kv_state given   -> returns (hidden state, k_new, v_new) so the model can append
+                            the new K/V to the cache.
+    """
+
+    def __init__(self, config: GPT2Config, layer: int):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = SelfAttentionWithKVCache(AttentionConfigBase(
+            n_embd=config.n_embd,
+            n_head=config.n_head,
+            dropout=config.dropout,
+            n_context=config.n_ctx
+        ), layer)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x, kv_state=None, padding_mask=None):
+        if kv_state is None:
+            x = x + self.attn(self.ln_1(x), padding_mask=padding_mask)
+            x = x + self.mlp(self.ln_2(x))
+            return x
+
+        a, k_new, v_new = self.attn(self.ln_1(x), kv_state, padding_mask)
+        x = x + a
+        x = x + self.mlp(self.ln_2(x))
+        return x, k_new, v_new
+
+
+class GPT2_v2(GPT2):
+    """GPT-2 with KV-cached generation. Same architecture/weights as v1, but its blocks are
+    cache-aware and generate() reuses past K/V instead of recomputing the whole sequence."""
+
+    def __init__(self, config: GPT2Config):
+        super().__init__(config)
+        # Swap in cache-aware blocks (same submodule names/params -> weight-compatible with v1).
+        self.h = nn.ModuleList([CachedBlock(config, i) for i in range(config.n_layer)])
+        self.lm_head.weight = self.wte.weight   # re-tie after rebuilding modules
+
+    def forward(self, idx, kv_state=None, padding_mask=None):
+        if kv_state is None:
+            return super().forward(idx)   # v1 path (CachedBlock returns x when kv_state is None)
+
+        B, T = idx.shape
+        past = kv_state.seq_len()                                   # tokens already cached
+        pos = torch.arange(past, past + T, device=idx.device)      # continue the position ids
+        x = self.drop(self.wte(idx) + self.wpe(pos))
+
+        k_news, v_news = [], []
+        for block in self.h:
+            x, k_new, v_new = block(x, kv_state=kv_state, padding_mask=padding_mask)
+            k_news.append(k_new)
+            v_news.append(v_new)
+        # Combine every layer's new K/V and append to the cache in one shot.
+        kv_state.update(torch.stack(k_news, dim=1), torch.stack(v_news, dim=1))
+
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens=50, temperature=1.0, top_k=None, eos_token_id=None):
+        B = idx.shape[0]
+        kv = KVState(B, self.config.n_layer, self.config.n_head,
+                     self.config.n_ctx, self.config.d_head, idx.device)
+
+        logits = self.forward(idx, kv_state=kv)          # prefill the whole prompt at once
+        for _ in range(max_new_tokens):
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_token], dim=1)
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+            logits = self.forward(next_token, kv_state=kv)   # decode: feed only the new token
+        return idx

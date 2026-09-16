@@ -33,7 +33,8 @@ import torch._dynamo as dynamo
 from torch._dynamo.utils import counters
 
 from src.llm.config.gpt2 import GPT2Config
-from src.llm.implemented.gpt2 import GPT2
+from src.llm.implemented.gpt2 import GPT2, GPT2_v2
+from src.utils.KVState import KVState
 from src.utils.requests import RequestGenerator
 
 VOCAB_SIZE = 50257
@@ -174,6 +175,59 @@ def analyze_torch_compile(model, requests, backend="eager") -> TorchCompileRepor
     )
 
 
+def analyze_v2_cached(model, config: GPT2Config, batch_sizes=(1, 2, 4), prompt_len=8,
+                      n_decode=8, backend="eager") -> TorchCompileReport:
+    """Compile analysis of GPT2_v2's KV-cached generation path.
+
+    Drives one generation session per batch size: each session allocates its own KVState,
+    prefills, then decodes n_decode single-token steps (growing that session's cache).
+    Running several batch sizes through the SAME compiled forward exposes BOTH dynamic axes
+    -- the batch dimension and the growing cache length -- as SymInts, which a fixed-batch
+    run would hide.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    def kv_for(b):
+        return KVState(b, config.n_layer, config.n_head, config.n_ctx, config.d_head, device)
+
+    def tokens(b, t):
+        return torch.randint(0, config.vocab_size, (b, t), device=device)
+
+    # guards + graph breaks: explain a prefill call (first batch size, throwaway cache)
+    dynamo.reset()
+    b0 = batch_sizes[0]
+    explanation = dynamo.explain(model.forward)(tokens(b0, prompt_len), kv_for(b0))
+    guards = explanation.out_guards or []
+    break_reasons = [getattr(r, "reason", str(r)) for r in (explanation.break_reasons or [])]
+
+    # symints + recompiles: one session per batch size (prefill + decode steps)
+    dynamo.reset()
+    counters.clear()
+    with capture_dynamo_logs() as logs:
+        compiled = torch.compile(model.forward, backend=backend)
+        with torch.no_grad():
+            for b in batch_sizes:
+                kv = kv_for(b)
+                compiled(tokens(b, prompt_len), kv_state=kv)   # prefill
+                for _ in range(n_decode):
+                    compiled(tokens(b, 1), kv_state=kv)         # decode (cache grows by 1)
+
+    return TorchCompileReport(
+        backend=backend,
+        num_requests=len(batch_sizes) * (1 + n_decode),    # forward calls across all sessions
+        total_compilations=counters["stats"].get("unique_graphs", 0),
+        frames_total=counters["frames"].get("total", 0),
+        frames_ok=counters["frames"].get("ok", 0),
+        graph_break_count=explanation.graph_break_count,
+        graph_break_reasons=break_reasons,
+        guard_count=len(guards),
+        guard_types=Counter(_guard_category(g) for g in guards),
+        symints=_parse_symints(logs),
+        recompiles=_parse_recompiles(logs),
+    )
+
+
 def print_report(report: TorchCompileReport) -> None:
     line = "=" * 72
     print(f"\n{line}\ntorch.compile analysis  (backend={report.backend})\n{line}")
@@ -211,23 +265,39 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", default="eager",
                         help="torch.compile backend for the analysis (default: eager)")
+    parser.add_argument("--mode", choices=["v1", "v2", "both"], default="both",
+                        help="which model to analyze: v1 (non-cached, 12 requests), "
+                             "v2 (KV-cached generation), or both (default)")
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4],
+                        help="v2: run one generation session per batch size (default: 1 2 4)")
+    parser.add_argument("--prompt-len", type=int, default=8, help="v2 prefill length")
+    parser.add_argument("--decode-steps", type=int, default=8, help="v2 decode steps per session")
     args = parser.parse_args()
 
-    gen = RequestGenerator(vocab_size=VOCAB_SIZE, seed=0)
-    requests = gen.build(REQUEST_SPECS)
+    if args.mode in ("v1", "both"):
+        gen = RequestGenerator(vocab_size=VOCAB_SIZE, seed=0)
+        requests = gen.build(REQUEST_SPECS)
+        model = GPT2(GPT2Config(vocab_size=VOCAB_SIZE)).eval()
 
-    model = GPT2(GPT2Config(vocab_size=VOCAB_SIZE)).eval()
+        # Process all 12 requests eagerly first.
+        print("processing requests (eager):")
+        with torch.no_grad():
+            for req in requests:
+                logits = model(req.tokens)
+                print(f"  {req.name:<10} in={tuple(req.tokens.shape)} -> logits={tuple(logits.shape)}")
 
-    # Process all 12 requests eagerly first.
-    print("processing requests (eager):")
-    with torch.no_grad():
-        for req in requests:
-            logits = model(req.tokens)
-            print(f"  {req.name:<10} in={tuple(req.tokens.shape)} -> logits={tuple(logits.shape)}")
+        print("\n### GPT2 v1 -- non-cached, 12 fixed-shape requests ###")
+        print_report(analyze_torch_compile(model, requests, backend=args.backend))
 
-    # Then start with the torch.compile analysis.
-    report = analyze_torch_compile(model, requests, backend=args.backend)
-    print_report(report)
+    if args.mode in ("v2", "both"):
+        cfg = GPT2Config(vocab_size=VOCAB_SIZE)
+        model_v2 = GPT2_v2(cfg).eval()
+        print(f"\n### GPT2_v2 -- KV-cached generation "
+              f"(batch sizes {args.batch_sizes}: each 1 prefill of {args.prompt_len} "
+              f"+ {args.decode_steps} decode steps) ###")
+        print_report(analyze_v2_cached(model_v2, cfg, batch_sizes=args.batch_sizes,
+                                       prompt_len=args.prompt_len, n_decode=args.decode_steps,
+                                       backend=args.backend))
 
 
 if __name__ == "__main__":
