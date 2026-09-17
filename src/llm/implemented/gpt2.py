@@ -153,10 +153,8 @@ class CompiledGPT2(GPT2):
 class CachedBlock(nn.Module):
     """Transformer block for GPT2_v2: a KV-cache-aware sibling of Block.
 
-    forward() is overloaded on kv_state:
-      - kv_state is None -> plain block, returns the hidden state (training / no cache).
-      - kv_state given   -> returns (hidden state, k_new, v_new) so the model can append
-                            the new K/V to the cache.
+    Returns the hidden state. When kv_state is given, the attention writes its new K/V into
+    the preallocated cache in place (nothing to propagate back up to the model).
     """
 
     def __init__(self, config: GPT2Config, layer: int):
@@ -172,15 +170,10 @@ class CachedBlock(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, kv_state=None, padding_mask=None):
-        if kv_state is None:
-            x = x + self.attn(self.ln_1(x), padding_mask=padding_mask)
-            x = x + self.mlp(self.ln_2(x))
-            return x
-
-        a, k_new, v_new = self.attn(self.ln_1(x), kv_state, padding_mask)
-        x = x + a
+        # attn writes into the cache in place when kv_state is given; returns just y either way.
+        x = x + self.attn(self.ln_1(x), kv_state, padding_mask)
         x = x + self.mlp(self.ln_2(x))
-        return x, k_new, v_new
+        return x
 
 
 class GPT2_v2(GPT2):
@@ -202,13 +195,9 @@ class GPT2_v2(GPT2):
         pos = torch.arange(past, past + T, device=idx.device)      # continue the position ids
         x = self.drop(self.wte(idx) + self.wpe(pos))
 
-        k_news, v_news = [], []
-        for block in self.h:
-            x, k_new, v_new = block(x, kv_state=kv_state, padding_mask=padding_mask)
-            k_news.append(k_new)
-            v_news.append(v_new)
-        # Combine every layer's new K/V and append to the cache in one shot.
-        kv_state.update(torch.stack(k_news, dim=1), torch.stack(v_news, dim=1))
+        for block in self.h:                # each block writes its K/V into the cache in place
+            x = block(x, kv_state=kv_state, padding_mask=padding_mask)
+        kv_state.advance(T)                 # all layers wrote at the same cursor; advance once
 
         x = self.ln_f(x)
         return self.lm_head(x)

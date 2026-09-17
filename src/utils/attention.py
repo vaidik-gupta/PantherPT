@@ -83,8 +83,6 @@ class SelfAttentionWithKVCache(SelfAttention):
             # No cache -> behave exactly like the plain (non-cached) attention.
             return super().forward(x, padding_mask)
 
-        # Read this layer's cached past K/V; the new K/V are concatenated in below.
-        
         qkv = self.c_attn(x)
         q, k_new, v_new = qkv.split(self.n_embd, dim=2)
 
@@ -92,8 +90,9 @@ class SelfAttentionWithKVCache(SelfAttention):
         k_new = k_new.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         v_new = v_new.view(B, T, self.n_head, self.d_head).transpose(1, 2)
 
-        k, v = kv_state.read(self.layer)
-        k, v = torch.cat([k, k_new], dim=2), torch.cat([v, v_new], dim=2)
+        # Write the new K/V into this layer's preallocated cache slice and read back the
+        # valid region (past + new) as views -- no copy of the past (contrast torch.cat).
+        k, v = kv_state.write(self.layer, k_new, v_new)
 
         # Total cached length (past tokens + the T new ones) and where this block starts.
         S = k.shape[2]
@@ -116,6 +115,4 @@ class SelfAttentionWithKVCache(SelfAttention):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
 
-        # Return the new K/V as well: the model collects them from every layer and appends
-        # them to the KVState in one combined update per step.
-        return y, k_new, v_new
+        return y
