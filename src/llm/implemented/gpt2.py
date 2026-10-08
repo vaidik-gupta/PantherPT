@@ -222,3 +222,23 @@ class GPT2_v2(GPT2):
                 break
             logits = self.forward(next_token, kv_state=kv)   # decode: feed only the new token
         return idx
+
+
+class CompiledGPT2_v2(GPT2_v2):
+    """GPT2_v2 whose KV-cached forward is JIT-compiled with torch.compile.
+
+    Same weights, state_dict and (inherited) cached generate loop as GPT2_v2, but the
+    forward runs through a torch.compile'd graph. Compilation is lazy: it happens on the
+    first forward, and the prefill vs decode shapes each trigger their own graph before the
+    generation settles into steady state.
+    """
+
+    def __init__(self, config: GPT2Config):
+        super().__init__(config)
+        # Compile the *parent* forward (not self.forward) so the compiled call does not
+        # recurse back through this override. Held as a plain attribute so torch does not
+        # treat it as a submodule/parameter.
+        self._compiled_forward = torch.compile(GPT2_v2.forward)
+
+    def forward(self, idx, kv_state=None, padding_mask=None):
+        return self._compiled_forward(self, idx, kv_state=kv_state, padding_mask=padding_mask)
