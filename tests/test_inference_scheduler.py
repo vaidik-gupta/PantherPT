@@ -16,7 +16,7 @@ from src.services.inference.scheduler.retention import (
 )
 from src.services.inference.scheduler.storage import (
     CapacityExceededError,
-    InMemoryRequestStorage,
+    InMemoryFifo,
     RequestState,
     RequestStorage,
 )
@@ -32,11 +32,11 @@ def test_interfaces_require_implementations(abstraction):
 @pytest.mark.parametrize("capacity", [0, -1])
 def test_storage_requires_positive_capacity(capacity):
     with pytest.raises(ValueError, match="positive"):
-        InMemoryRequestStorage(capacity)
+        InMemoryFifo(capacity)
 
 
 def test_pending_selection_is_non_destructive_and_not_limited_to_fifo():
-    storage = InMemoryRequestStorage[InferenceRequest](3)
+    storage = InMemoryFifo[InferenceRequest](3)
     ids = tuple(uuid4() for _ in range(3))
     records = tuple(
         storage.submit(request_id, InferenceRequest(prompt="Hello", model=model))
@@ -58,9 +58,41 @@ def test_pending_selection_is_non_destructive_and_not_limited_to_fifo():
     assert storage.get(ids[0]).state is RequestState.RUNNING
 
 
+def test_pending_limit_returns_oldest_prefix():
+    storage = InMemoryFifo[str](5)
+    ids = tuple(uuid4() for _ in range(5))
+    records = tuple(storage.submit(request_id, f"p{i}") for i, request_id in enumerate(ids))
+
+    assert storage.pending(0) == ()
+    assert storage.pending(2) == records[:2]
+    assert storage.pending(5) == records
+    assert storage.pending(10) == records
+    assert storage.pending(None) == records
+    assert storage.pending() == records
+
+
+def test_pending_limit_tracks_oldest_after_claim():
+    storage = InMemoryFifo[str](3)
+    ids = tuple(uuid4() for _ in range(3))
+    records = tuple(storage.submit(request_id, f"p{i}") for i, request_id in enumerate(ids))
+
+    storage.claim((ids[0],))
+
+    assert storage.pending(1) == (records[1],)
+    assert storage.pending(2) == records[1:]
+
+
+def test_pending_rejects_negative_limit():
+    storage = InMemoryFifo[str](1)
+    storage.submit(uuid4(), "only")
+
+    with pytest.raises(ValueError, match="non-negative"):
+        storage.pending(-1)
+
+
 @pytest.mark.parametrize("invalid_claim", ["unknown", "running", "duplicate"])
 def test_batch_claim_is_all_or_nothing(invalid_claim):
-    storage = InMemoryRequestStorage[str](2)
+    storage = InMemoryFifo[str](2)
     first, second = uuid4(), uuid4()
     storage.submit(first, "first")
     storage.submit(second, "second")
@@ -84,7 +116,7 @@ def test_batch_claim_is_all_or_nothing(invalid_claim):
 
 
 def test_capacity_includes_running_requests_and_releases_on_finish():
-    storage = InMemoryRequestStorage[str](1)
+    storage = InMemoryFifo[str](1)
     request_id = uuid4()
     storage.submit(request_id, "first")
     storage.claim((request_id,))
@@ -100,7 +132,7 @@ def test_capacity_includes_running_requests_and_releases_on_finish():
 
 
 def test_duplicate_submission_does_not_replace_payload():
-    storage = InMemoryRequestStorage[str](2)
+    storage = InMemoryFifo[str](2)
     request_id = uuid4()
     original = storage.submit(request_id, "original")
 
@@ -112,7 +144,7 @@ def test_duplicate_submission_does_not_replace_payload():
 
 @pytest.mark.parametrize("state", list(RequestState))
 def test_queued_requests_can_only_be_cancelled(state):
-    storage = InMemoryRequestStorage[str](1)
+    storage = InMemoryFifo[str](1)
     request_id = uuid4()
     storage.submit(request_id, "queued")
     if state is RequestState.CANCELLED:
@@ -129,7 +161,7 @@ def test_queued_requests_can_only_be_cancelled(state):
     "state", [RequestState.SUCCEEDED, RequestState.FAILED, RequestState.CANCELLED]
 )
 def test_running_requests_finish_once(state):
-    storage = InMemoryRequestStorage[str](1)
+    storage = InMemoryFifo[str](1)
     request_id = uuid4()
     storage.submit(request_id, "running")
     storage.claim((request_id,))
@@ -176,7 +208,7 @@ def test_completion_before_wait_is_delivered_and_released(result):
 
 def test_runner_to_waiting_client_lifecycle():
     async def scenario():
-        storage = InMemoryRequestStorage[InferenceRequest](1)
+        storage = InMemoryFifo[InferenceRequest](1)
         retention = UntilDeliveredResultRetention[DeliveryResult[str]]()
         delivery = FutureClientDelivery[str](retention)
         request_id = uuid4()
@@ -242,7 +274,7 @@ def test_only_one_waiter_and_registration_per_request():
 @pytest.mark.parametrize("complete_first", [False, True])
 def test_waiter_cancellation_cleans_delivery_without_freeing_runner_capacity(complete_first):
     async def scenario():
-        storage = InMemoryRequestStorage[str](1)
+        storage = InMemoryFifo[str](1)
         retention = UntilDeliveredResultRetention[DeliveryResult[str]]()
         delivery = FutureClientDelivery[str](retention)
         request_id = uuid4()

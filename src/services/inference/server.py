@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from starlette.middleware.base import RequestResponseEndpoint
 
 from src.services.inference.auth import require_api_key
-from src.services.inference.scheduler.base import BaseScheduler, SchedulerUnavailableError
+from src.services.inference.scheduler.core import BaseScheduler, SchedulerUnavailableError
 from src.services.inference.scheduler.delivery import DeliveryClosedError
 from src.services.inference.scheduler.storage import CapacityExceededError
 from src.services.inference.schemas import InferenceRequest, InferenceResponse

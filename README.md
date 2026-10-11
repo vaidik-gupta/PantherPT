@@ -148,11 +148,11 @@ interfaces from their initial implementations:
 
 | Interface | Initial implementation | Responsibility |
 | --- | --- | --- |
-| `RequestStorage[Payload]` | `InMemoryRequestStorage` | Bounded request registry and non-destructive pending selection; atomic all-or-nothing claims |
+| `RequestStorage[Payload]` | `InMemoryStorageBase` → `InMemoryFifo` | Abstract in-memory registry, capacity bound and atomic claims; `InMemoryFifo` adds an insertion-ordered, non-destructive pending index |
 | `ClientDelivery[Result]` | `FutureClientDelivery` | One async waiter per request; final result or runner error delivery |
 | `ResultRetention[Result]` | `UntilDeliveredResultRetention` | Keep completed outcomes only until the waiter consumes them or delivery is abandoned |
 
-`BaseScheduler[Payload, Result]` in `scheduler/base.py` composes these foundations.
+`BaseScheduler[Payload, Result]` in `scheduler/core/base.py` composes these foundations.
 An actual scheduler extends it and implements `run()` (selection/dispatch policy)
 and `stop_running()` (stop all owned runner work before returning).
 These hooks must not await `close()` on their own scheduler.

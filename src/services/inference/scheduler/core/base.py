@@ -11,7 +11,7 @@ from src.services.inference.scheduler.delivery import (
 )
 from src.services.inference.scheduler.retention import UntilDeliveredResultRetention
 from src.services.inference.scheduler.storage import (
-    InMemoryRequestStorage,
+    InMemoryFifo,
     RequestState,
     RequestStorage,
     StoredRequest,
@@ -54,7 +54,7 @@ class BaseScheduler[Payload, Result](ABC):
     @classmethod
     def with_defaults(cls, max_requests: int) -> Self:
         return cls(
-            InMemoryRequestStorage[Payload](max_requests),
+            InMemoryFifo[Payload](max_requests),
             FutureClientDelivery[Result](UntilDeliveredResultRetention()),
         )
 
@@ -141,13 +141,17 @@ class BaseScheduler[Payload, Result](ABC):
         self.submit(request_id, payload)
         return await self.wait(request_id)
 
-    def pending(self) -> tuple[StoredRequest[Payload], ...]:
+    def pending(
+        self, limit: int | None = None
+    ) -> tuple[StoredRequest[Payload], ...]:
         self._check_ready()
-        return self._storage.pending()
+        return self._storage.pending(limit)
 
-    async def wait_for_pending(self) -> tuple[StoredRequest[Payload], ...]:
+    async def wait_for_pending(
+        self, limit: int | None = None
+    ) -> tuple[StoredRequest[Payload], ...]:
         while True:
-            candidates = self.pending()
+            candidates = self.pending(limit)
             if candidates:
                 return candidates
             self._work.clear()

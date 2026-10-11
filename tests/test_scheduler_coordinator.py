@@ -6,7 +6,7 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
-from src.services.inference.scheduler.base import BaseScheduler, SchedulerUnavailableError
+from src.services.inference.scheduler.core import BaseScheduler, SchedulerUnavailableError
 from src.services.inference.scheduler.delivery import (
     DeliveryClosedError,
     DeliveryResult,
@@ -15,7 +15,7 @@ from src.services.inference.scheduler.delivery import (
 from src.services.inference.scheduler.retention import UntilDeliveredResultRetention
 from src.services.inference.scheduler.storage import (
     CapacityExceededError,
-    InMemoryRequestStorage,
+    InMemoryFifo,
     RequestState,
 )
 from src.services.inference.schemas import InferenceRequest
@@ -75,14 +75,28 @@ class HoldingScheduler(BaseScheduler[InferenceRequest, str]):
         pass
 
 
-def test_scheduler_requires_policy_and_runner_shutdown_implementations():
+def test_coordinator_pending_forwards_limit_to_storage():
+    async def scenario():
+        scheduler = IdleScheduler.with_defaults(max_requests=3)
+        await scheduler.start()
+        ids = tuple(uuid4() for _ in range(3))
+        try:
+            for request_id in ids:
+                scheduler.submit(request_id, InferenceRequest(prompt="Hello"))
+            assert len(scheduler.pending()) == 3
+            assert tuple(r.request_id for r in scheduler.pending(2)) == ids[:2]
+            assert len(scheduler.pending(0)) == 0
+        finally:
+            await scheduler.close()
+
+    asyncio.run(scenario())
     with pytest.raises(TypeError):
         BaseScheduler.with_defaults(max_requests=1)
 
 
 def test_coordinator_admission_claim_completion_and_retention():
     async def scenario():
-        storage = InMemoryRequestStorage[InferenceRequest](1)
+        storage = InMemoryFifo[InferenceRequest](1)
         retention = UntilDeliveredResultRetention[DeliveryResult[str]]()
         scheduler = IdleScheduler(storage, FutureClientDelivery(retention))
         await scheduler.start()
@@ -207,7 +221,7 @@ def test_shutdown_retains_capacity_until_runner_stops():
                 stop_requested.set()
                 await stopped.wait()
 
-        storage = InMemoryRequestStorage[InferenceRequest](1)
+        storage = InMemoryFifo[InferenceRequest](1)
         scheduler = SlowStoppingScheduler(storage, FutureClientDelivery(
             UntilDeliveredResultRetention()
         ))
@@ -278,7 +292,7 @@ def test_shutdown_failure_is_logged_and_does_not_release_running_capacity(caplog
             async def stop_running(self):
                 raise RuntimeError("Runner could not be stopped.")
 
-        storage = InMemoryRequestStorage[InferenceRequest](1)
+        storage = InMemoryFifo[InferenceRequest](1)
         scheduler = CannotStopScheduler(storage, FutureClientDelivery(
             UntilDeliveredResultRetention()
         ))
@@ -353,7 +367,7 @@ def test_http_overload_and_cancelled_client_do_not_free_running_capacity(monkeyp
     monkeypatch.setenv("INFERENCE_API_KEY", "test-key")
 
     async def scenario():
-        storage = InMemoryRequestStorage[InferenceRequest](1)
+        storage = InMemoryFifo[InferenceRequest](1)
         scheduler = HoldingScheduler(storage, FutureClientDelivery(
             UntilDeliveredResultRetention()
         ))
